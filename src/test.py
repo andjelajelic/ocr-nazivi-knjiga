@@ -3,91 +3,72 @@ import os
 import torch
 from torch.utils.data import DataLoader
 import config
-from dataset_loader import BookOCRDataset
+from dataset_loader import BookOCRDataset, collate_fn
 from model import CRNN
+from train import decode_predictions, compute_cer
 
-def decode_ctc_prediction(output, characters=config.CHARACTERS):
-    """Pravilno dekodiranje CTC izlaza za jednu sliku/isečak."""
-    prob_indices = torch.argmax(output, dim=2)[:, 0]
-    indices_list = prob_indices.tolist()
-    
-    decoded_text = ""
-    prev_idx = None
-    for idx in indices_list:
-        if idx == prev_idx or idx >= len(characters):
-            prev_idx = idx
-            continue
-        char = characters[idx]
-        if char != '-':
-            decoded_text += char
-        prev_idx = idx
-    return decoded_text.strip()
-
-def get_book_id(filename):
-    """Izvlači ID knjige iz naziva fajla (npr. '19_L02.jpg' -> '19')."""
-    basename = os.path.basename(filename)
-    return basename.split('_')[0]
 
 def main():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Koristim uređaj: {device}")
+
     test_dir = os.path.join(os.getcwd(), 'dataset/test')
     if not os.path.exists(test_dir):
         test_dir = os.path.join(os.getcwd(), 'dataset/train')
-        print("⚠️  Upozorenje: 'dataset/test' ne postoji. Testiramo na TRAIN skupu sa grupisanjem.\n")
-        
-    test_dataset = BookOCRDataset(test_dir)
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
-    
-    model = CRNN()
-    model_path = os.path.join(os.getcwd(), 'ocr_model.pth')
-    
-    if not os.path.exists(model_path):
-        print(f"❌ Greška: Ne postoji sačuvan model na putanji {model_path}!")
-        return
-        
-    model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
-    model.eval()
-    print("🚀 Model uspešno učitan! Grupišem isečke po ID-u knjige...\n")
-    
-    # Rečnici u koje ćemo pakovati podatke za svaku knjigu posebno
-    knjige_stvarno = {}      # { '1': "Stvarni Naslov Iz Delova" }
-    knjige_predikcija = {}   # { '1': "Predvidjeni Naslov Iz Delova" }
-    
-    brojac = 0
-    with torch.no_grad():
-        for batch in test_loader:
-            images = batch[0]
-            labels = batch[1]
-            
-            # 1. Saznajemo kojoj knjizi pripada ovaj isečak
-            putanja_slike = test_dataset.image_paths[brojac]
-            knjiga_id = get_book_id(putanja_slike)
-            
-            # 2. Pustimo isečak kroz model i dekodiramo tekst
-            outputs = model(images)
-            predikcija_isecka = decode_ctc_prediction(outputs)
-            stvarni_tekst_isecka = "".join([config.CHARACTERS[idx] for idx in labels[0].tolist() if idx < len(config.CHARACTERS)])
-            
-            # 3. Ako prvi put vidimo ovu knjigu, napravi prazan string, inače dodaj razmak i nadoveži
-            if knjiga_id not in knjige_stvarno:
-                knjige_stvarno[knjiga_id] = stvarni_tekst_isecka
-                knjige_predikcija[knjiga_id] = predikcija_isecka
-            else:
-                knjige_stvarno[knjiga_id] += " " + stvarni_tekst_isecka
-                knjige_predikcija[knjiga_id] += " " + predikcija_isecka
-                
-            brojac += 1
+        print("Nema 'test' foldera, koristim 'train' za evaluaciju.\n")
 
-    # 4. Lep ispis grupisanih rezultata (prikazaćemo prvih 5 kompletnih knjiga)
-    prikazano_knjiga = 0
-    for kid in sorted(knjige_stvarno.keys(), key=lambda x: int(x) if x.isdigit() else x):
-        if prikazano_knjiga >= 5:
-            break
-            
-        print(f"📚 KNJIGA sa ID: {kid}")
-        print(f"   CELI STVARNI NASLOV:   '{knjige_stvarno[kid]}'")
-        print(f"   CELA OCR PREDIKCIJA:   '{knjige_predikcija[kid]}'")
-        print("=" * 60)
-        prikazano_knjiga += 1
+    test_dataset = BookOCRDataset(test_dir, augment=False)
+    print(f"Broj slika za testiranje: {len(test_dataset)}\n")
+
+    model = CRNN().to(device)
+    model_path = os.path.join(os.getcwd(), 'ocr_model.pth')
+
+    if not os.path.exists(model_path):
+        print(f"GREŠKA: Model nije pronađen na: {model_path}")
+        print("Pokreni train.py prvo!")
+        return
+
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+    print("Model učitan. Pokrećem evaluaciju...\n")
+    print("=" * 55)
+
+    image_paths = test_dataset.image_paths
+    ukupni_cer = 0.0
+    tacnih = 0
+    total = min(len(test_dataset), 20)  # Prikazujemo max 20
+
+    with torch.no_grad():
+        for i in range(total):
+            img, label, _ = test_dataset[i]
+            img = img.unsqueeze(0).to(device)
+
+            output = model(img)
+            predikcija = decode_predictions(output)
+            stvarno = "".join([config.CHARACTERS[idx] for idx in label.tolist()])
+
+            cer = compute_cer(predikcija, stvarno)
+            ukupni_cer += cer
+
+            if predikcija == stvarno:
+                tacnih += 1
+                status = "✓"
+            else:
+                status = "✗"
+
+            ime_fajla = os.path.basename(image_paths[i])
+            print(f"{status} [{ime_fajla}]")
+            print(f"  STVARNO:    '{stvarno}'")
+            print(f"  PREDIKCIJA: '{predikcija}'")
+            print(f"  CER: {cer*100:.1f}%")
+            print("-" * 40)
+
+    print(f"\n{'='*55}")
+    print(f"REZULTATI NA {total} SLIKA:")
+    print(f"  Tačnost (exact match): {tacnih}/{total} = {tacnih/total*100:.1f}%")
+    print(f"  Prosečan CER: {ukupni_cer/total*100:.1f}%")
+    print(f"{'='*55}")
+
 
 if __name__ == "__main__":
     main()
