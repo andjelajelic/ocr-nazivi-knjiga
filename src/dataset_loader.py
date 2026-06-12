@@ -1,5 +1,6 @@
-
+# src/dataset_loader.py
 import os
+import glob
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
@@ -9,45 +10,55 @@ import config
 class BookOCRDataset(Dataset):
     def __init__(self, data_dir):
         self.data_dir = data_dir
-        # Kupimo sve slike iz zadatog foldera
-        self.image_names = [f for f in os.listdir(data_dir) if f.endswith(('.jpg', '.jpeg', '.png'))]
-        # Mapiranje: karakter -> broj
-        self.char_to_num = {char: idx for idx, char in enumerate(config.CHARACTERS)}
+        
+        sve_slike = []
+        ekstenzije = ["*.jpg", "*.JPG", "*.png", "*.PNG", "*.jpeg", "*.JPEG"]
+        
+        for ext in ekstenzije:
+            sve_slike.extend(glob.glob(os.path.join(data_dir, ext)))
+            
+        self.image_paths = sorted(sve_slike)
+        self.char_to_idx = config.CHAR_TO_IDX
         
     def __len__(self):
-        return len(self.image_names)
+        return len(self.image_paths)
         
     def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        txt_path = os.path.splitext(img_path)[0] + ".txt"
+        
         # 1. Učitavanje i obrada slike
-        img_name = self.image_names[idx]
-        img_path = os.path.join(self.data_dir, img_name)
+        image = Image.open(img_path).convert('L') # Grayscale
+        image = image.resize((config.IMG_WIDTH, config.IMG_HEIGHT)) # 256x64
         
-        image = Image.open(img_path).convert('L') # Grayscale (crno-belo)
-        image = image.resize((config.IMG_WIDTH, config.IMG_HEIGHT))
-        
-        image = np.array(image, dtype=np.float32) / 255.0 # Normalizacija na [0, 1]
-        image = np.expand_dims(image, axis=0) # Dodajemo dimenziju kanala (1, 64, 256)
-        image = torch.tensor(image, dtype=torch.float32)
+        # Pretvaranje u tenzor preko numpy-ja (izbegavamo stare warning-e)
+        img_np = np.array(image, dtype=np.float32) / 255.0
+        image_tensor = torch.from_numpy(img_np).unsqueeze(0) # Dimenzija: [1, 64, 256]
         
         # 2. Učitavanje i obrada tekstualnog labela
-        txt_name = os.path.splitext(img_name)[0] + '.txt'
-        txt_path = os.path.join(self.data_dir, txt_name)
-        
-        with open(txt_path, 'r', encoding='utf-8') as f:
-            text = f.read().strip()
+        if os.path.exists(txt_path):
+            with open(txt_path, 'r', encoding='utf-8') as f:
+                text = f.read().strip()
+        else:
+            text = ""
             
-        # Pretvaramo slova u brojeve prema rečniku
-        label = [self.char_to_num[char] for char in text if char in self.char_to_num]
-        label = torch.tensor(label, dtype=torch.long)
+        # Pretvaramo slova u brojeve prateći velika i mala slova
+        label_indices = []
+        for char in text:
+            if char in self.char_to_idx:
+                label_indices.append(self.char_to_idx[char])
+            else:
+                if ' ' in self.char_to_idx:
+                    label_indices.append(self.char_to_idx[' '])
+                else:
+                    label_indices.append(0)
+                
+        label_tensor = torch.tensor(label_indices, dtype=torch.long)
+        label_length = torch.tensor([len(label_indices)], dtype=torch.long)
         
-        label_length = torch.tensor(len(label), dtype=torch.long)
-        
-        return image, label, label_length
+        return image_tensor, label_tensor, label_length
 
-# TEST CODE: Da proverimo da li sve radi
 if __name__ == "__main__":
-    import sys
-    # Provera da li kod vidi dataset folder iz root-a projekta
     train_path = os.path.join(os.getcwd(), 'dataset/train')
     print(f"Pokušavam da učitam slike iz: {train_path}")
     
